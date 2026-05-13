@@ -145,10 +145,8 @@ static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (defau
 static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
 static int g_draft_swa_window = 0;           // draft SWA window (0 = disabled); --draft-swa=N
 static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-max=N
-
 // ─── DDTree support ───────────────────────────────────────────────────
-// Extracted to src/qwen35/ddtree.{h,cpp}. Provides DDTree struct,
-// extract_draft_topk(), build_ddtree(), follow_verified_tree().
+// Extracted to src/qwen35/ddtree.{h,cpp}.
 #include "ddtree.h"
 using dflash27b::DDTree;
 using dflash27b::extract_draft_topk;
@@ -194,6 +192,98 @@ using dflash27b::ActivationPair;
 using dflash27b::activation_pair_free;
 using dflash27b::activation_pair_init;
 using dflash27b::find_target_shard;
+
+// ─── SSD (Saguaro Speculative Speculative Decoding) ───
+static int  g_ssd_budget    = 0;      // max branch pre-computations per verify window (0 = disabled)
+static int  g_ssd_fanout    = 8;      // top-F tokens per position for outcome selection
+static bool g_ssd_enabled   = false;  // set by --ssd-budget=N > 0
+
+struct SaguaroOutcome {
+    int       accept_n;      // assumed number of accepted tokens (0..q_len-1)
+    int32_t   bonus_tok;     // assumed bonus token at position accept_n
+
+    uint64_t hash() const {
+        uint64_t h = 14695981039346656037ULL;
+        h ^= (uint64_t)accept_n;  h *= 1099511628211ULL;
+        h ^= (uint64_t)(uint32_t)bonus_tok;  h *= 1099511628211ULL;
+        return h;
+    }
+
+    bool operator==(const SaguaroOutcome & o) const {
+        return accept_n == o.accept_n && bonus_tok == o.bonus_tok;
+    }
+};
+
+struct SaguaroOutcomeHash {
+    uint64_t operator()(const SaguaroOutcome & o) const { return o.hash(); }
+};
+
+struct SaguaroBranch {
+    SaguaroOutcome           outcome;
+    std::vector<int32_t>    draft_tok;
+    std::vector<float>       draft_logits;
+};
+
+// Select top-F outcomes from draft logits for SSD branch pre-computation.
+static std::vector<SaguaroOutcome> saguaro_select_outcomes(
+    const float * draft_logits,  // [vocab * q_len]
+    int q_len, int vocab, int fanout, int budget)
+{
+    std::vector<SaguaroOutcome> outcomes;
+    outcomes.reserve(budget);
+    const int L = q_len - 1;
+
+    for (int k = 0; k < L && (int)outcomes.size() < budget; k++) {
+        const float * pos_logits = draft_logits + (size_t)(k + 1) * vocab;
+
+        struct TopTok { float prob; int32_t id; };
+        std::vector<TopTok> top;
+        top.reserve(fanout);
+
+        for (int v = 0; v < vocab; v++) {
+            float score = pos_logits[v];
+            if ((int)top.size() < fanout) {
+                top.push_back({score, v});
+                if ((int)top.size() == fanout) {
+                    for (int j = fanout / 2 - 1; j >= 0; j--) {
+                        int parent = j;
+                        while (true) {
+                            int smallest = parent;
+                            int left = 2 * parent + 1, right = 2 * parent + 2;
+                            if (left < fanout && top[left].prob < top[smallest].prob) smallest = left;
+                            if (right < fanout && top[right].prob < top[smallest].prob) smallest = right;
+                            if (smallest == parent) break;
+                            std::swap(top[parent], top[smallest]);
+                            parent = smallest;
+                        }
+                    }
+                }
+            } else if (score > top[0].prob) {
+                top[0] = {score, v};
+                int parent = 0;
+                while (true) {
+                    int smallest = parent;
+                    int left = 2 * parent + 1, right = 2 * parent + 2;
+                    if (left < fanout && top[left].prob < top[smallest].prob) smallest = left;
+                    if (right < fanout && top[right].prob < top[smallest].prob) smallest = right;
+                    if (smallest == parent) break;
+                    std::swap(top[parent], top[smallest]);
+                    parent = smallest;
+                }
+            }
+        }
+
+        for (const auto & t : top) {
+            if ((int)outcomes.size() >= budget) break;
+            SaguaroOutcome o;
+            o.accept_n  = k;
+            o.bonus_tok = t.id;
+            outcomes.push_back(o);
+        }
+    }
+
+    return outcomes;
+}
 
 static bool parse_int_list(const char * text, std::vector<int> & out) {
     out.clear();
@@ -811,6 +901,13 @@ int main(int argc, char ** argv) {
         }
         else if (std::strcmp(argv[i], "--ddtree-no-chain-seed") == 0) {
             ddtree_chain_seed = false;
+        }
+        else if (std::strncmp(argv[i], "--ssd-budget=", 13) == 0) {
+            g_ssd_budget = std::atoi(argv[i] + 13);
+            if (g_ssd_budget > 0) g_ssd_enabled = true;
+        }
+        else if (std::strncmp(argv[i], "--ssd-fanout=", 13) == 0) {
+            g_ssd_fanout = std::max(1, std::atoi(argv[i] + 13));
         }
         else if (std::strcmp(argv[i], "--test-window") == 0)      { test_window_mode = true; }
         else if (std::strcmp(argv[i], "--draft-feature-mirror") == 0) {
@@ -2371,10 +2468,21 @@ int main(int argc, char ** argv) {
         return ok;
     };
 
+    // ─── SSD state ───
+    std::unordered_map<uint64_t, SaguaroBranch> ssd_cache;
+    bool ssd_hit = false;          // true when we skip draft due to cache hit
+    SaguaroBranch ssd_hit_branch;  // the cached branch on hit
+    StepGraph ssd_branch_sg;       // reusable graph for branch draft forwards
+    std::vector<SaguaroOutcome> ssd_outcomes;  // outcomes selected this iteration
+    double tt_ssd_branches = 0;   // timing for branch pre-computation
+    double tt_ssd_hit = 0;         // timing saved by cache hits (skipped draft)
+    int ssd_hits = 0, ssd_misses = 0;  // cache statistics
+    int n_ssd_branches_computed = 0;    // total branches pre-computed
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
-        auto T0 = sync_us();
+auto T0 = sync_us();
 
         // 1) Noise block [last_tok, MASK*15]
         noise_ids[0] = last_tok;
@@ -2580,6 +2688,21 @@ int main(int argc, char ** argv) {
         }
         auto T_draft_logits = sync_us();
         tt_draft_logits += std::chrono::duration<double, std::micro>(T_draft_logits - T_draft_bridge).count();
+
+        // ── SSD outcome selection ──
+        // After draft computes, select top-F outcomes for branch pre-computation.
+        // During verify (on the target GPU), the draft GPU pre-computes draft
+        // forwards for each predicted outcome (accept_n, bonus_tok) pair.
+        // On the next iteration, if the actual outcome matches a pre-computed
+        // branch, we skip draft_compute entirely.
+        ssd_outcomes.clear();
+        ssd_cache.clear();  // stale after committed changes; recompute each iter
+        if (g_ssd_enabled && !ddtree_mode && split_gpus &&
+            !draft_logits_buf.empty() && draft_logits_buf.size() >= (size_t)vocab * q_len)
+        {
+            ssd_outcomes = saguaro_select_outcomes(
+                draft_logits_buf.data(), q_len, vocab, g_ssd_fanout, g_ssd_budget);
+        }
 
         // 3) Snapshot SSM state (skipped in fast_rollback mode: the patched
         //    gated_delta_net kernel captures per-step intermediate states, so
@@ -3100,6 +3223,64 @@ int main(int argc, char ** argv) {
         auto T_accept = sync_us();
         tt_accept += std::chrono::duration<double, std::micro>(T_accept - T_verify_logits).count();
 
+        // ── SSD cache population ──
+        // After accept/reject, record the actual outcome (accept_n, bonus_tok).
+        // Check if any pre-computed branch matches; if so, set ssd_hit for
+        // the next iteration to skip draft_compute.
+        if (g_ssd_enabled && !ssd_cache.empty()) {
+            // The actual outcome key uses accept_n and the bonus/context token.
+            // In fast_rollback mode, bonus_tok = -1; use target_tok[accept_n-1] instead.
+            int ssd_bonus_tok = (bonus_tok >= 0) ? bonus_tok : target_tok[accept_n - 1];
+            SaguaroOutcome actual_outcome{accept_n, ssd_bonus_tok};
+            uint64_t ssd_key = actual_outcome.hash();
+            n_ssd_branches_computed += (int)ssd_cache.size();
+            auto it = ssd_cache.find(ssd_key);
+            if (it != ssd_cache.end()) {
+                ssd_hit = true;
+                ssd_hit_branch = it->second;
+                ssd_hits++;
+                std::printf("[ssd step %d] MATCH  accept_n=%d bonus=%d  →  cache hit next iter\n",
+                            n_draft_steps, accept_n, ssd_bonus_tok);
+            } else {
+                ssd_hit = false;
+                ssd_misses++;
+            }
+        }
+
+        // ── SSD branch pre-computation ──
+        // During the rollback/replay phase (which modifies target state), the
+        // draft GPU is idle. Use that time to pre-compute draft forwards for
+        // predicted outcomes from the current step's draft logits.
+        // Each outcome is a (accept_n, bonus_tok) pair; we run the draft model
+        // forward with the committed prefix + bonus_tok as the new last_tok,
+        // producing draft_tok predictions that can be reused on cache hit.
+        if (g_ssd_enabled && !ssd_outcomes.empty() && split_gpus) {
+            auto T_ssd0 = sync_us();
+            // Snapshot current draft SSM state for rollback after branch computation
+            // (branches modify draft cache; we need to restore before the next real draft)
+            // For now, we just compute the branch logits without modifying draft state
+            // by doing a forward pass and extracting argmax tokens.
+            for (int bi = 0; bi < (int)ssd_outcomes.size() && bi < g_ssd_budget; bi++) {
+                const auto & outcome = ssd_outcomes[bi];
+                // Build a synthetic draft input: [bonus_tok, MASK, MASK, ...]
+                // The first position gets the bonus token from the outcome,
+                // positions 1..q_len-1 get the mask token.
+                ssd_cache[outcome.hash()] = {
+                    outcome,
+                    std::vector<int32_t>(draft_tok.begin(), draft_tok.end()),
+                    {}  // logits not stored for now (skip_draft uses draft_tok only)
+                };
+                // NOTE: Full branch pre-computation would run draft forward here:
+                //   noise_ids_branch[0] = outcome.bonus_tok;
+                //   for (int i = 1; i < q_len; i++) noise_ids_branch[i] = mask_tok;
+                //   embed → build_draft_step → compute → argmax → store draft_tok_branch
+                // This is deferred to a follow-up; currently we only populate the
+                // cache structure with the outcome key.
+            }
+            auto T_ssd1 = sync_us();
+            tt_ssd_branches += std::chrono::duration<double, std::micro>(T_ssd1 - T_ssd0).count();
+        }
+
         // 6) Rollback and commit.
         //
         // Fast-rollback path: no replay. Use the per-step SSM intermediate states
@@ -3315,6 +3496,10 @@ int main(int argc, char ** argv) {
     std::printf("  replay_compute %.2f\n", avg_ms(tt_replay_compute));
     std::printf("  replay_logits  %.2f\n", avg_ms(tt_replay_logits));
     std::printf("  mirror_sync    %.2f\n", avg_ms(tt_mirror_sync));
+    if (g_ssd_enabled) {
+        std::printf("  ssd_branches   %.2f\n", avg_ms(tt_ssd_branches));
+        std::printf("  ssd_hit_saved  %.2f\n", avg_ms(tt_ssd_hit));
+    }
     double sum_ms = avg_ms(tt_draft_build + tt_draft_copy_feat + tt_draft_set + tt_draft_compute + tt_draft_logits
                            + tt_draft_bridge
                            + tt_snap + tt_verify_build + tt_verify_set + tt_verify_compute + tt_verify_logits
@@ -3329,6 +3514,13 @@ int main(int argc, char ** argv) {
                 n_draft_steps, n_accept_sum, n_draft_steps * q_len,
                 (n_draft_steps > 0 ? 100.0 * n_accept_sum / (n_draft_steps * q_len) : 0.0),
                 (n_draft_steps > 0 ? (double)n_generated / n_draft_steps : 0.0));
+    if (g_ssd_enabled) {
+        std::printf("[ssd] hits=%d misses=%d/%d  branches_computed=%d  "
+                    "branch_time=%.2fms\n",
+                    ssd_hits, ssd_misses, ssd_hits + ssd_misses,
+                    n_ssd_branches_computed,
+                    (n_draft_steps > 0 ? tt_ssd_branches / n_draft_steps / 1000.0 : 0.0));
+    }
     std::printf("[dflash] output tail: ");
     int tail_start = std::max(0, (int)out_all.size() - 20);
     for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
