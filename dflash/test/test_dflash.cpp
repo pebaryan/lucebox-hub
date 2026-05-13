@@ -2690,6 +2690,14 @@ auto T0 = sync_us();
             ggml_backend_tensor_get(draft_sg.argmax_tokens, gpu_argmax.data(), 0,
                                     sizeof(int32_t) * q_len);
             for (int i = 0; i < q_len; i++) draft_tok[i] = gpu_argmax[i];
+            // SSD needs full draft logits for outcome selection.
+            // When draft_hidden_bridge is active, logits are already in
+            // draft_logits_buf via proj_sg. On single GPU, we must
+            // transfer them from the draft step's output tensor.
+            if (g_ssd_enabled && !ddtree_mode && !draft_hidden_bridge) {
+                ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                        sizeof(float) * vocab * q_len);
+            }
         }
         // The block-diffusion draft is free to "denoise" position 0 even though
         // the input there is the unmasked last_tok. Pin it back so verify and
@@ -2746,7 +2754,7 @@ auto T0 = sync_us();
         // branch, we skip draft_compute entirely.
         ssd_outcomes.clear();
         ssd_cache.clear();  // stale after committed changes; recompute each iter
-        if (g_ssd_enabled && !ddtree_mode && split_gpus &&
+        if (g_ssd_enabled && !ddtree_mode &&
             !draft_logits_buf.empty() && draft_logits_buf.size() >= (size_t)vocab * q_len)
         {
             ssd_outcomes = saguaro_select_outcomes(
@@ -2777,7 +2785,7 @@ auto T0 = sync_us();
         // The feature ring and positions use the same committed context as the
         // main draft pass.
         int n_ssd_branches_launched = 0;
-        if (g_ssd_enabled && !ssd_outcomes.empty() && split_gpus) {
+        if (g_ssd_enabled && !ssd_outcomes.empty()) {
             auto T_ssd0 = sync_us();
             // Branch buffers — reused across outcomes within this iteration.
             static std::vector<int32_t> noise_ids_branch;
