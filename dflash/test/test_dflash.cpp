@@ -233,11 +233,17 @@ static std::vector<SaguaroOutcome> saguaro_select_outcomes(
     outcomes.reserve(budget);
     const int L = q_len - 1;
 
-    for (int k = 0; k < L && (int)outcomes.size() < budget; k++) {
+    // Distribute budget across acceptance positions to ensure we cover
+    // multiple accept_n values, not just accept_n=0. Use round-robin
+    // across positions k=0..L-1, taking top-1 at each position per round.
+    // This ensures accept_n=1,2,...,L are represented before doubling
+    // down on accept_n=0.
+    struct TopTok { float prob; int32_t id; };
+    // Pre-compute top-fanout for each position.
+    std::vector<std::vector<TopTok>> pos_top(L);
+    for (int k = 0; k < L; k++) {
         const float * pos_logits = draft_logits + (size_t)(k + 1) * vocab;
-
-        struct TopTok { float prob; int32_t id; };
-        std::vector<TopTok> top;
+        auto & top = pos_top[k];
         top.reserve(fanout);
 
         for (int v = 0; v < vocab; v++) {
@@ -272,13 +278,23 @@ static std::vector<SaguaroOutcome> saguaro_select_outcomes(
                 }
             }
         }
+        // Sort descending by score for priority selection
+        std::sort(top.begin(), top.end(), [](const TopTok & a, const TopTok & b) {
+            return a.prob > b.prob;
+        });
+    }
 
-        for (const auto & t : top) {
-            if ((int)outcomes.size() >= budget) break;
-            SaguaroOutcome o;
-            o.accept_n  = k;
-            o.bonus_tok = t.id;
-            outcomes.push_back(o);
+    // Round-robin: take top-f from each position, prioritizing spread
+    // over accept_n diversity. For the first pass, take the #1 token
+    // at each position; then #2, etc.
+    for (int rank = 0; rank < fanout && (int)outcomes.size() < budget; rank++) {
+        for (int k = 0; k < L && (int)outcomes.size() < budget; k++) {
+            if (rank < (int)pos_top[k].size()) {
+                SaguaroOutcome o;
+                o.accept_n  = k + 1;  // accept k+1 tokens, bonus at position k+1
+                o.bonus_tok = pos_top[k][rank].id;
+                outcomes.push_back(o);
+            }
         }
     }
 
@@ -2934,6 +2950,11 @@ auto T0 = sync_us();
             tt_ssd_branches += std::chrono::duration<double, std::micro>(T_ssd1 - T_ssd0).count();
         }
 
+        // Reset verify build timestamp after SSD branch section.
+        // T_verify_build was initialized to T_snap, but branch pre-computation
+        // runs between snapshot and verify; exclude it from verify_build timing.
+        T_snap = sync_us();  // refresh timestamp before verify
+
         // 4) Target verify on draft tokens.
         //
         // Two paths, toggled by --seq-verify:
@@ -3454,7 +3475,6 @@ auto T0 = sync_us();
             int ssd_bonus_tok = (bonus_tok >= 0) ? bonus_tok : target_tok[accept_n - 1];
             SaguaroOutcome actual_outcome{accept_n, ssd_bonus_tok};
             uint64_t ssd_key = actual_outcome.hash();
-            n_ssd_branches_computed += (int)ssd_cache.size();
             auto it = ssd_cache.find(ssd_key);
             if (it != ssd_cache.end()) {
                 ssd_hit = true;
