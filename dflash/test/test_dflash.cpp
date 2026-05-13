@@ -2746,6 +2746,194 @@ auto T0 = sync_us();
         auto T_snap = sync_us();
         tt_snap += std::chrono::duration<double, std::micro>(T_snap - T_draft_logits).count();
 
+        // ── SSD branch pre-computation ──
+        // Pre-compute draft forwards for predicted outcomes. Each outcome is a
+        // (accept_n, bonus_tok) pair; we run the draft model forward with
+        // [bonus_tok, MASK, MASK, ...] as input, producing draft_tok predictions.
+        //
+        // Placement: after SSM snapshot and before target verify. This ensures the
+        // draft GPU is occupied while the target GPU will do verify. Currently
+        // synchronous; future work will overlap branch compute with verify via
+        // ggml_backend_graph_compute_async on a separate stream.
+        //
+        // The draft model is stateless per call (no SSM state between forwards),
+        // so each branch is a standalone embed → build → compute → argmax.
+        // The feature ring and positions use the same committed context as the
+        // main draft pass.
+        int n_ssd_branches_launched = 0;
+        if (g_ssd_enabled && !ssd_outcomes.empty() && split_gpus) {
+            auto T_ssd0 = sync_us();
+            // Branch buffers — reused across outcomes within this iteration.
+            static std::vector<int32_t> noise_ids_branch;
+            static std::vector<float>   noise_embed_buf_branch;
+            noise_ids_branch.resize(q_len);
+            noise_embed_buf_branch.resize((size_t)hidden * q_len);
+            static std::vector<int32_t> pos_q_buf_branch, pos_k_buf_branch;
+
+            for (int bi = 0; bi < (int)ssd_outcomes.size() && bi < g_ssd_budget; bi++) {
+                const auto & outcome = ssd_outcomes[bi];
+
+                // Build synthetic noise input: [bonus_tok, MASK, MASK, ...]
+                noise_ids_branch[0] = outcome.bonus_tok;
+                for (int i = 1; i < q_len; i++) noise_ids_branch[i] = mask_tok;
+
+                // Embed the branch input
+                if (!w.embedder.embed(noise_ids_branch.data(), q_len,
+                                       noise_embed_buf_branch.data())) {
+                    std::fprintf(stderr, "[ssd] branch embed failed for outcome %d\n", bi);
+                    break;
+                }
+
+                // Build draft step with same ctx_len and mirror state
+                if (!build_draft_step(ssd_branch_sg, dw,
+                                      draft_hidden_bridge ? nullptr : &w,
+                                      draft_backend, /*ctx_len=*/draft_ctx,
+                                      use_mirror_view ? &feature_mirror : nullptr,
+                                      committed)) {
+                    std::fprintf(stderr, "[ssd] branch build_draft_step failed for outcome %d\n", bi);
+                    break;
+                }
+
+                // Set branch inputs
+                ggml_backend_tensor_set(ssd_branch_sg.inp_embed,
+                                        noise_embed_buf_branch.data(), 0,
+                                        sizeof(float) * noise_embed_buf_branch.size());
+
+                // Copy target features into branch graph (same logic as main draft)
+                if (!use_mirror_view) {
+                    if (draft_feature_mirror) {
+                        if (!copy_feature_ring_range_to_tensor(
+                                feature_mirror, ssd_branch_sg.target_hidden_cat,
+                                draft_start, draft_ctx)) {
+                            std::fprintf(stderr, "[ssd] branch mirror copy failed\n");
+                            break;
+                        }
+                    } else {
+                        const size_t fc_in    = (size_t)5 * hidden;
+                        const int    cap      = cache.target_feat_cap;
+                        const size_t elt_feat = ggml_element_size(cache.target_feat);
+                        const size_t row_bf16 = fc_in * elt_feat;
+                        const int    slot0    = draft_start % cap;
+                        const int    pre_n    = std::min(draft_ctx, cap - slot0);
+                        const int    post_n   = draft_ctx - pre_n;
+
+                        if (!split_gpus) {
+                            cudaSetDevice(draft_gpu);
+                            auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+                            bf16_to_f32(
+                                (const char *)cache.target_feat->data + (size_t)slot0 * row_bf16,
+                                (float *)ssd_branch_sg.target_hidden_cat->data,
+                                (int64_t)pre_n * fc_in,
+                                nullptr);
+                            if (post_n > 0) {
+                                bf16_to_f32(
+                                    (const char *)cache.target_feat->data,
+                                    (float *)((char *)ssd_branch_sg.target_hidden_cat->data +
+                                               (size_t)pre_n * fc_in * sizeof(float)),
+                                    (int64_t)post_n * fc_in,
+                                    nullptr);
+                            }
+                        } else {
+                            std::vector<uint16_t> bf16_lin((size_t)draft_ctx * fc_in);
+                            for (int i = 0; i < pre_n; i++) {
+                                const int    slot = slot0 + i;
+                                const size_t off  = (size_t)slot * row_bf16;
+                                ggml_backend_tensor_get(cache.target_feat,
+                                                        bf16_lin.data() + (size_t)i * fc_in,
+                                                        off, row_bf16);
+                            }
+                            for (int j = 0; j < post_n; j++) {
+                                const size_t off = (size_t)j * row_bf16;
+                                ggml_backend_tensor_get(cache.target_feat,
+                                                        bf16_lin.data() + (size_t)(pre_n + j) * fc_in,
+                                                        off, row_bf16);
+                            }
+                            std::vector<float> f32_lin((size_t)draft_ctx * fc_in);
+                            for (size_t k = 0; k < bf16_lin.size(); k++) {
+                                uint32_t bits = (uint32_t)bf16_lin[k] << 16;
+                                float    f;
+                                std::memcpy(&f, &bits, sizeof(f));
+                                f32_lin[k] = f;
+                            }
+                            ggml_backend_tensor_set(ssd_branch_sg.target_hidden_cat, f32_lin.data(), 0,
+                                                    f32_lin.size() * sizeof(float));
+                        }
+                    }
+                }
+
+                // Set positions (same as main draft: draft_ctx base)
+                pos_q_buf_branch.resize(q_len);
+                pos_k_buf_branch.resize((size_t)draft_ctx + q_len);
+                for (int i = 0; i < q_len; i++) pos_q_buf_branch[i] = draft_ctx + i;
+                for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf_branch[i] = i;
+                ggml_backend_tensor_set(ssd_branch_sg.positions, pos_q_buf_branch.data(), 0,
+                                        sizeof(int32_t) * pos_q_buf_branch.size());
+                ggml_backend_tensor_set(ssd_branch_sg.positions_k, pos_k_buf_branch.data(), 0,
+                                        sizeof(int32_t) * pos_k_buf_branch.size());
+
+                // Compute branch forward on draft GPU
+                st = ggml_backend_graph_compute(draft_backend, ssd_branch_sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[ssd] branch compute failed: %d\n", (int)st);
+                    break;
+                }
+
+                // Handle hidden bridge (peer copy draft → target, then project)
+                if (draft_hidden_bridge) {
+                    if (!proj_sg.gf || !proj_sg.hidden_input ||
+                        proj_sg.hidden_input->ne[1] != q_len) {
+                        if (!build_lm_head_projection_step(proj_sg, w, target_backend, q_len)) {
+                            std::fprintf(stderr, "[ssd] branch lm-head projection build failed\n");
+                            break;
+                        }
+                    }
+                    const size_t hidden_bytes = ggml_nbytes(ssd_branch_sg.hidden_states);
+                    if (!copy_peer_async(proj_sg.hidden_input->data, target_gpu,
+                                         ssd_branch_sg.hidden_states->data, draft_gpu,
+                                         hidden_bytes)) {
+                        std::fprintf(stderr, "[ssd] branch hidden bridge copy failed\n");
+                        break;
+                    }
+                    ggml_backend_synchronize(target_backend);
+                    st = ggml_backend_graph_compute(target_backend, proj_sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[ssd] branch lm-head projection compute failed: %d\n", (int)st);
+                        break;
+                    }
+                }
+
+                // Extract branch draft tokens via argmax
+                std::vector<int32_t> branch_tok(q_len);
+                if (ssd_branch_sg.argmax_tokens) {
+                    ggml_backend_tensor_get(ssd_branch_sg.argmax_tokens,
+                                             branch_tok.data(), 0,
+                                             sizeof(int32_t) * q_len);
+                } else if (ssd_branch_sg.logits) {
+                    // CPU fallback argmax (slower, for non-GPU paths)
+                    std::vector<float> branch_logits((size_t)vocab * q_len);
+                    ggml_backend_tensor_get(ssd_branch_sg.logits,
+                                             branch_logits.data(), 0,
+                                             sizeof(float) * branch_logits.size());
+                    for (int i = 0; i < q_len; i++) {
+                        const float * row = branch_logits.data() + (size_t)i * vocab;
+                        int best = 0;
+                        for (int v = 1; v < vocab; v++) {
+                            if (row[v] > row[best]) best = v;
+                        }
+                        branch_tok[i] = best;
+                    }
+                }
+
+                // Store in SSD cache
+                ssd_cache[outcome.hash()] = { outcome, branch_tok, {} };
+
+                n_ssd_branches_launched++;
+                n_ssd_branches_computed++;
+            }
+            auto T_ssd1 = sync_us();
+            tt_ssd_branches += std::chrono::duration<double, std::micro>(T_ssd1 - T_ssd0).count();
+        }
+
         // 4) Target verify on draft tokens.
         //
         // Two paths, toggled by --seq-verify:
@@ -3278,191 +3466,6 @@ auto T0 = sync_us();
                 ssd_hit = false;
                 ssd_misses++;
             }
-        }
-
-        // ── SSD branch pre-computation ──
-        // During the rollback/replay phase (which modifies target state), the
-        // draft GPU is idle. Use that time to pre-compute draft forwards for
-        // predicted outcomes from the current step's draft logits.
-        // Each outcome is a (accept_n, bonus_tok) pair; we run the draft model
-        // forward with the committed prefix + bonus_tok as the new last_tok,
-        // producing draft_tok predictions that can be reused on cache hit.
-        //
-        // The draft model is stateless per call (no SSM state between forwards),
-        // so each branch is a standalone embed → build → compute → argmax.
-        // The feature ring and positions use the same committed context as the
-        // main draft pass (branches are predictions from the same checkpoint).
-        if (g_ssd_enabled && !ssd_outcomes.empty() && split_gpus) {
-            auto T_ssd0 = sync_us();
-            // Branch buffers — reused across outcomes within this iteration.
-            static std::vector<int32_t> noise_ids_branch;
-            static std::vector<float>   noise_embed_buf_branch;
-            noise_ids_branch.resize(q_len);
-            noise_embed_buf_branch.resize((size_t)hidden * q_len);
-            static std::vector<int32_t> pos_q_buf_branch, pos_k_buf_branch;
-
-            for (int bi = 0; bi < (int)ssd_outcomes.size() && bi < g_ssd_budget; bi++) {
-                const auto & outcome = ssd_outcomes[bi];
-
-                // Build synthetic noise input: [bonus_tok, MASK, MASK, ...]
-                noise_ids_branch[0] = outcome.bonus_tok;
-                for (int i = 1; i < q_len; i++) noise_ids_branch[i] = mask_tok;
-
-                // Embed the branch input
-                if (!w.embedder.embed(noise_ids_branch.data(), q_len,
-                                       noise_embed_buf_branch.data())) {
-                    std::fprintf(stderr, "[ssd] branch embed failed for outcome %d\n", bi);
-                    break;
-                }
-
-                // Build draft step with same ctx_len and mirror state
-                if (!build_draft_step(ssd_branch_sg, dw,
-                                      draft_hidden_bridge ? nullptr : &w,
-                                      draft_backend, /*ctx_len=*/draft_ctx,
-                                      use_mirror_view ? &feature_mirror : nullptr,
-                                      committed)) {
-                    std::fprintf(stderr, "[ssd] branch build_draft_step failed for outcome %d\n", bi);
-                    break;
-                }
-
-                // Set branch inputs
-                ggml_backend_tensor_set(ssd_branch_sg.inp_embed,
-                                        noise_embed_buf_branch.data(), 0,
-                                        sizeof(float) * noise_embed_buf_branch.size());
-
-                // Copy target features into branch graph (same logic as main draft)
-                if (!use_mirror_view) {
-                    if (draft_feature_mirror) {
-                        if (!copy_feature_ring_range_to_tensor(
-                                feature_mirror, ssd_branch_sg.target_hidden_cat,
-                                draft_start, draft_ctx)) {
-                            std::fprintf(stderr, "[ssd] branch mirror copy failed\n");
-                            break;
-                        }
-                    } else {
-                        const size_t fc_in    = (size_t)5 * hidden;
-                        const int    cap      = cache.target_feat_cap;
-                        const size_t elt_feat = ggml_element_size(cache.target_feat);
-                        const size_t row_bf16 = fc_in * elt_feat;
-                        const int    slot0    = draft_start % cap;
-                        const int    pre_n    = std::min(draft_ctx, cap - slot0);
-                        const int    post_n   = draft_ctx - pre_n;
-
-                        if (!split_gpus) {
-                            // Same GPU — branch pre-computation only runs on split_gpus,
-                            // but handle same-GPU gracefully for testing.
-                            cudaSetDevice(draft_gpu);
-                            auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-                            bf16_to_f32(
-                                (const char *)cache.target_feat->data + (size_t)slot0 * row_bf16,
-                                (float *)ssd_branch_sg.target_hidden_cat->data,
-                                (int64_t)pre_n * fc_in,
-                                nullptr);
-                            if (post_n > 0) {
-                                bf16_to_f32(
-                                    (const char *)cache.target_feat->data,
-                                    (float *)((char *)ssd_branch_sg.target_hidden_cat->data +
-                                               (size_t)pre_n * fc_in * sizeof(float)),
-                                    (int64_t)post_n * fc_in,
-                                    nullptr);
-                            }
-                        } else {
-                            // Split GPU: read BF16 from target, convert on CPU, upload to draft
-                            std::vector<uint16_t> bf16_lin((size_t)draft_ctx * fc_in);
-                            for (int i = 0; i < pre_n; i++) {
-                                const int    slot = slot0 + i;
-                                const size_t off  = (size_t)slot * row_bf16;
-                                ggml_backend_tensor_get(cache.target_feat,
-                                                        bf16_lin.data() + (size_t)i * fc_in,
-                                                        off, row_bf16);
-                            }
-                            for (int j = 0; j < post_n; j++) {
-                                const size_t off = (size_t)j * row_bf16;
-                                ggml_backend_tensor_get(cache.target_feat,
-                                                        bf16_lin.data() + (size_t)(pre_n + j) * fc_in,
-                                                        off, row_bf16);
-                            }
-                            std::vector<float> f32_lin((size_t)draft_ctx * fc_in);
-                            for (size_t k = 0; k < bf16_lin.size(); k++) {
-                                uint32_t bits = (uint32_t)bf16_lin[k] << 16;
-                                float    f;
-                                std::memcpy(&f, &bits, sizeof(f));
-                                f32_lin[k] = f;
-                            }
-                            ggml_backend_tensor_set(ssd_branch_sg.target_hidden_cat, f32_lin.data(), 0,
-                                                    f32_lin.size() * sizeof(float));
-                        }
-                    }
-                }
-
-                // Set positions (same as main draft: draft_ctx base)
-                pos_q_buf_branch.resize(q_len);
-                pos_k_buf_branch.resize((size_t)draft_ctx + q_len);
-                for (int i = 0; i < q_len; i++) pos_q_buf_branch[i] = draft_ctx + i;
-                for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf_branch[i] = i;
-                ggml_backend_tensor_set(ssd_branch_sg.positions, pos_q_buf_branch.data(), 0,
-                                        sizeof(int32_t) * pos_q_buf_branch.size());
-                ggml_backend_tensor_set(ssd_branch_sg.positions_k, pos_k_buf_branch.data(), 0,
-                                        sizeof(int32_t) * pos_k_buf_branch.size());
-
-                // Compute branch forward
-                st = ggml_backend_graph_compute(draft_backend, ssd_branch_sg.gf);
-                if (st != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "[ssd] branch compute failed: %d\n", (int)st);
-                    break;
-                }
-
-                // Handle hidden bridge (same as main draft)
-                if (draft_hidden_bridge) {
-                    if (!proj_sg.gf || !proj_sg.hidden_input ||
-                        proj_sg.hidden_input->ne[1] != q_len) {
-                        if (!build_lm_head_projection_step(proj_sg, w, target_backend, q_len)) {
-                            std::fprintf(stderr, "[ssd] branch lm-head projection build failed\n");
-                            break;
-                        }
-                    }
-                    const size_t hidden_bytes = ggml_nbytes(ssd_branch_sg.hidden_states);
-                    if (!copy_peer_async(proj_sg.hidden_input->data, target_gpu,
-                                         ssd_branch_sg.hidden_states->data, draft_gpu,
-                                         hidden_bytes)) {
-                        std::fprintf(stderr, "[ssd] branch hidden bridge copy failed\n");
-                        break;
-                    }
-                    ggml_backend_synchronize(target_backend);
-                    st = ggml_backend_graph_compute(target_backend, proj_sg.gf);
-                    if (st != GGML_STATUS_SUCCESS) {
-                        std::fprintf(stderr, "[ssd] branch lm-head projection compute failed: %d\n", (int)st);
-                        break;
-                    }
-                }
-
-                // Extract branch draft tokens via argmax
-                std::vector<int32_t> branch_tok(q_len);
-                if (ssd_branch_sg.argmax_tokens) {
-                    ggml_backend_tensor_get(ssd_branch_sg.argmax_tokens,
-                                             branch_tok.data(), 0,
-                                             sizeof(int32_t) * q_len);
-                } else if (ssd_branch_sg.logits) {
-                    // CPU fallback argmax (slower, for non-GPU paths)
-                    std::vector<float> branch_logits((size_t)vocab * q_len);
-                    ggml_backend_tensor_get(ssd_branch_sg.logits,
-                                             branch_logits.data(), 0,
-                                             sizeof(float) * branch_logits.size());
-                    for (int i = 0; i < q_len; i++) {
-                        const float * row = branch_logits.data() + (size_t)i * vocab;
-                        int best = 0;
-                        for (int v = 1; v < vocab; v++) {
-                            if (row[v] > row[best]) best = v;
-                        }
-                        branch_tok[i] = best;
-                    }
-                }
-
-                // Store in SSD cache
-                ssd_cache[outcome.hash()] = { outcome, branch_tok, {} };
-            }
-            auto T_ssd1 = sync_us();
-            tt_ssd_branches += std::chrono::duration<double, std::micro>(T_ssd1 - T_ssd0).count();
         }
 
         // 6) Rollback and commit.
