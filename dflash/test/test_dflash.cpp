@@ -2484,10 +2484,34 @@ int main(int argc, char ** argv) {
 
 auto T0 = sync_us();
 
+        // ── SSD cache hit: skip entire draft section ──
+        // On a hit, ssd_hit_branch.draft_tok already contains the predicted
+        // tokens from the branch that was pre-computed last iteration.
+        // We copy them into draft_tok and skip draft_compute entirely.
+        const bool skip_draft = (g_ssd_enabled && ssd_hit);
+        if (skip_draft) {
+            // Restore cached draft predictions.
+            for (int i = 0; i < q_len && i < (int)ssd_hit_branch.draft_tok.size(); i++) {
+                draft_tok[i] = ssd_hit_branch.draft_tok[i];
+            }
+            draft_tok[0] = last_tok;  // pin root position
+
+            // Record timing: we saved the full draft section (compute + bridge + logits).
+            auto T_ssd_skip = sync_us();
+            tt_ssd_hit += std::chrono::duration<double, std::micro>(T_ssd_skip - T0).count();
+
+            // Clear ssd_cache — stale after committed changes.
+            ssd_cache.clear();
+            ssd_hit = false;  // consume the hit
+            ssd_outcomes.clear();  // no draft logits, can't select outcomes
+        }
+
         // 1) Noise block [last_tok, MASK*15]
         noise_ids[0] = last_tok;
         for (int i = 1; i < q_len; i++) noise_ids[i] = mask_tok;
-        if (!w.embedder.embed(noise_ids.data(), q_len, noise_embed_buf.data())) return 1;
+        if (!skip_draft) {
+            if (!w.embedder.embed(noise_ids.data(), q_len, noise_embed_buf.data())) return 1;
+        }
 
         // Draft target-attention window. The draft transformer attends over
         // a slice of the history captured in cache.target_feat; this caps the
@@ -2503,8 +2527,16 @@ auto T0 = sync_us();
         const bool use_mirror_view =
             draft_feature_mirror_can_view(feature_mirror, committed, draft_ctx, mirror_slot0);
         const bool draft_hidden_bridge = split_gpus;
+        ggml_status st = GGML_STATUS_SUCCESS;  // reusable across draft & verify
+        const int ddtree_K = (ddtree_budget > q_len - 1) ? 8 : 1;
+        static std::vector<float>   ddtree_top_log_probs; // [L × K]
+        static std::vector<int32_t> ddtree_top_token_ids; // [L × K]
+        auto T0_draft = T0;  // timing fallbacks for skip_draft
+        decltype(T0) T_draft_bridge = T0;
+        decltype(T0) T_draft_logits = T0;
 
         // 2) Draft forward
+        if (!skip_draft) {
         if (!build_draft_step(draft_sg, dw,
                               draft_hidden_bridge ? nullptr : w.output,
                               draft_backend, /*ctx_len=*/draft_ctx,
@@ -2593,7 +2625,7 @@ auto T0 = sync_us();
         auto T_draft_set = sync_us();
         tt_draft_set += std::chrono::duration<double, std::micro>(T_draft_set - T_draft_copy).count();
 
-        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
+        st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
         if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "draft compute %d\n", (int)st); return 1; }
         auto T_draft_compute = sync_us();
         tt_draft_compute += std::chrono::duration<double, std::micro>(T_draft_compute - T_draft_set).count();
@@ -2627,12 +2659,11 @@ auto T0 = sync_us();
             ggml_backend_tensor_get(proj_sg.logits, draft_logits_buf.data(), 0,
                                     sizeof(float) * vocab * q_len);
         }
-        auto T_draft_bridge = sync_us();
+        T_draft_bridge = sync_us();
         tt_draft_bridge += std::chrono::duration<double, std::micro>(T_draft_bridge - T_draft_compute).count();
 
         // DDTree top-K: use GPU argmax for draft_tok; full logits transfer
         // only when DDTree needs top-K (K>1) for sibling expansion.
-        const int ddtree_K = (ddtree_budget > q_len - 1) ? 8 : 1;
 
         if (draft_hidden_bridge) {
             for (int i = 0; i < q_len; i++) {
@@ -2657,8 +2688,6 @@ auto T0 = sync_us();
         // tree siblings. Budget <= L means pure chain → no siblings needed, so
         // we can skip the O(L*vocab) top-K extract entirely and just fill rank 0
         // from draft_tok. For larger budgets we need real top-K.
-        static std::vector<float>   ddtree_top_log_probs; // [L × K]
-        static std::vector<int32_t> ddtree_top_token_ids; // [L × K]
         if (ddtree_mode) {
             const int L = q_len - 1;
             if ((int)ddtree_top_log_probs.size() < L * ddtree_K) {
@@ -2686,7 +2715,11 @@ auto T0 = sync_us();
                                    ddtree_temp);
             }
         }
-        auto T_draft_logits = sync_us();
+        } // end if (!skip_draft)
+
+        if (!skip_draft) {
+            T_draft_logits = sync_us();
+        }
         tt_draft_logits += std::chrono::duration<double, std::micro>(T_draft_logits - T_draft_bridge).count();
 
         // ── SSD outcome selection ──
