@@ -2794,6 +2794,19 @@ auto T0 = sync_us();
             noise_embed_buf_branch.resize((size_t)hidden * q_len);
             static std::vector<int32_t> pos_q_buf_branch, pos_k_buf_branch;
 
+            // Build branch graph once per iteration (all branches share the
+            // same structure: same ctx_len, q_len, mirror settings).
+            // Unlike the main draft step, which rebuilds every iteration,
+            // branch graphs only differ in input data (bonus token, features).
+            if (!build_draft_step(ssd_branch_sg, dw,
+                                  draft_hidden_bridge ? nullptr : &w,
+                                  draft_backend, /*ctx_len=*/draft_ctx,
+                                  use_mirror_view ? &feature_mirror : nullptr,
+                                  committed)) {
+                std::fprintf(stderr, "[ssd] branch build_draft_step failed\n");
+                ssd_outcomes.clear();  // skip branches this iteration
+            }
+
             for (int bi = 0; bi < (int)ssd_outcomes.size() && bi < g_ssd_budget; bi++) {
                 const auto & outcome = ssd_outcomes[bi];
 
@@ -2808,15 +2821,7 @@ auto T0 = sync_us();
                     break;
                 }
 
-                // Build draft step with same ctx_len and mirror state
-                if (!build_draft_step(ssd_branch_sg, dw,
-                                      draft_hidden_bridge ? nullptr : &w,
-                                      draft_backend, /*ctx_len=*/draft_ctx,
-                                      use_mirror_view ? &feature_mirror : nullptr,
-                                      committed)) {
-                    std::fprintf(stderr, "[ssd] branch build_draft_step failed for outcome %d\n", bi);
-                    break;
-                }
+                // Reuse branch graph (built once before the loop). Only update inputs.
 
                 // Set branch inputs
                 ggml_backend_tensor_set(ssd_branch_sg.inp_embed,
