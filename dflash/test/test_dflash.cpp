@@ -2770,11 +2770,25 @@ auto T0 = sync_us();
         auto T_snap = sync_us();
         tt_snap += std::chrono::duration<double, std::micro>(T_snap - T_draft_logits).count();
 
+        // ── Async overlap: on split GPUs with SSD branches, launch target
+        // verify on the target GPU before branch pre-computation. The draft
+        // GPU computes branches while the target GPU verifies, overlapping
+        // two independent workloads. After branches finish, we sync the
+        // target backend to collect verify results.
+        bool verify_async_launched = false;
+        // Verify timing anchors — populated by async launch or by the normal
+        // verify path. Declared here so both paths can write them.
+        auto T_verify_build = sync_us();  // will be overwritten by verify path
+        auto T_verify_set   = T_verify_build;
+        auto T_verify_compute = T_verify_build;
+
         // ── SSD branch pre-computation ──
         // Pre-compute draft forwards for predicted outcomes. Each outcome is a
         // (accept_n, bonus_tok) pair; we run the draft model forward with
         // [bonus_tok, MASK, MASK, ...] as input, producing draft_tok predictions.
         //
+        // On split GPUs, we launch the target verify asynchronously before
+        // branch pre-computation so both GPUs work in parallel.
         // Placement: after SSM snapshot and before target verify. This ensures the
         // draft GPU is occupied while the target GPU will do verify. Currently
         // synchronous; future work will overlap branch compute with verify via
@@ -2787,6 +2801,57 @@ auto T0 = sync_us();
         int n_ssd_branches_launched = 0;
         if (g_ssd_enabled && !ssd_outcomes.empty()) {
             auto T_ssd0 = sync_us();
+
+            // ── Async overlap: launch target verify before branch compute ──
+            // On split GPUs, the target and draft GPUs are independent devices.
+            // We can start target verify async on the target GPU, then compute
+            // branches on the draft GPU while the target GPU is verifying.
+            // After branches complete, we sync the target backend.
+            if (split_gpus && !seq_verify && !ddtree_mode) {
+                const int verify_fa_window = g_fa_window;
+                if (!build_target_step(sg, w, cache, backend,
+                                        /*kv_start=*/committed, /*n_tokens=*/q_len,
+                                        /*with_mask=*/true, /*capture=*/true,
+                                        /*capture_delta_intermediate=*/fast_rollback,
+                                        verify_fa_window)) {
+                    std::fprintf(stderr, "verify build (async) failed\n"); return 1;
+                }
+                auto tb0 = sync_us();
+
+                std::vector<float> verify_embed_async(hidden * q_len);
+                if (!w.embedder.embed(draft_tok.data(), q_len, verify_embed_async.data())) return 1;
+                ggml_backend_tensor_set(sg.inp_embed, verify_embed_async.data(), 0,
+                                        sizeof(float) * verify_embed_async.size());
+
+                for (int i = 0; i < q_len; i++) {
+                    int p = committed + i;
+                    pos4_buf[0 * q_len + i] = p;
+                    pos4_buf[1 * q_len + i] = p;
+                    pos4_buf[2 * q_len + i] = p;
+                    pos4_buf[3 * q_len + i] = 0;
+                }
+                ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
+
+                {
+                    const int verify_fa_window2 = g_fa_window;
+                    const int win_start_v = (verify_fa_window2 > 0 && committed > verify_fa_window2)
+                                                ? (committed - verify_fa_window2) : 0;
+                    const int win_len_v = committed + q_len - win_start_v;
+                    build_causal_mask(mask_buf, win_len_v, q_len, committed, win_start_v);
+                }
+                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
+                T_verify_set = sync_us();
+                T_verify_build = tb0;
+                tt_verify_build += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
+
+                // Launch target verify asynchronously — does NOT block CPU.
+                // Target GPU starts working while we compute branches on the draft GPU.
+                st = ggml_backend_graph_compute_async(backend, sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "verify compute (async) %d\n", (int)st); return 1;
+                }
+                verify_async_launched = true;
+            }
             // Branch buffers — reused across outcomes within this iteration.
             static std::vector<int32_t> noise_ids_branch;
             static std::vector<float>   noise_embed_buf_branch;
@@ -2964,9 +3029,14 @@ auto T0 = sync_us();
         }
 
         // Reset verify build timestamp after SSD branch section.
-        // T_verify_build was initialized to T_snap, but branch pre-computation
-        // runs between snapshot and verify; exclude it from verify_build timing.
-        T_snap = sync_us();  // refresh timestamp before verify
+        // When verify is launched async (before branches), T_verify_build was
+        // already set by the async launch path — don't overwrite it.
+        // When verify is synchronous, T_verify_build is initialized from T_snap
+        // below, but branch pre-computation runs between snap and verify;
+        // exclude it from verify_build timing.
+        if (!verify_async_launched) {
+            T_snap = sync_us();  // refresh timestamp before verify
+        }
 
         // 4) Target verify on draft tokens.
         //
@@ -2984,9 +3054,9 @@ auto T0 = sync_us();
         // at [committed..committed+commit_n-1]; positions past that are stale but
         // never read by the next iteration's draft.
 
-        auto T_verify_build = T_snap;
-        auto T_verify_set = T_snap;
-        auto T_verify_compute = T_snap;
+        // Verify timing already declared before branch section.
+        // T_verify_build, T_verify_set, T_verify_compute are set by
+        // either the async launch or the normal verify path.
 
         // ── DDTree path: tree-structured verify + walk + rollback ─────────
         //
@@ -3344,52 +3414,68 @@ auto T0 = sync_us();
         }
 
         if (!seq_verify) {
-            const int verify_fa_window = g_fa_window;
-            if (!build_target_step(sg, w, cache, backend,
-                                    /*kv_start=*/committed, /*n_tokens=*/q_len,
-                                    /*with_mask=*/true, /*capture=*/true,
-                                    /*capture_delta_intermediate=*/fast_rollback,
-                                    verify_fa_window,
-                                    /*last_token_logits_only=*/false,
-                                    g_kq_stride_pad)) {
-                std::fprintf(stderr, "verify build failed\n"); return 1;
+        if (verify_async_launched) {
+                // Verify was already launched async before branch pre-computation.
+                // Sync target GPU and extract results.
+                ggml_backend_synchronize(backend);
+                T_verify_compute = sync_us();
+                // verify_set was already recorded before async launch; 
+                // compute time now includes branch compute overlap
+                tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
+                // Note: T_verify_set was the timestamp before async launch.
+                // The effective compute time is the wall time from async launch
+                // to sync completion, which overlaps with branch compute.
+
+                ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
+                                        sizeof(int32_t) * q_len);
+            } else {
+                const int verify_fa_window = g_fa_window;
+                if (!build_target_step(sg, w, cache, backend,
+                                        /*kv_start=*/committed, /*n_tokens=*/q_len,
+                                        /*with_mask=*/true, /*capture=*/true,
+                                        /*capture_delta_intermediate=*/fast_rollback,
+                                        verify_fa_window,
+                                        /*last_token_logits_only=*/false,
+                                        g_kq_stride_pad)) {
+                    std::fprintf(stderr, "verify build failed\n"); return 1;
+                }
+                T_verify_build = sync_us();
+                tt_verify_build += std::chrono::duration<double, std::micro>(T_verify_build - T_snap).count();
+
+                std::vector<float> verify_embed(hidden * q_len);
+                if (!w.embedder.embed(draft_tok.data(), q_len, verify_embed.data())) return 1;
+                ggml_backend_tensor_set(sg.inp_embed, verify_embed.data(), 0,
+                                        sizeof(float) * verify_embed.size());
+
+                // M-RoPE axis-major layout: [axis0_tok0..axis0_tokN-1, axis1_..., axis2_..., axis3_...].
+                // First 3 axes hold the token position; axis 3 is always 0 for text.
+                for (int i = 0; i < q_len; i++) {
+                    int p = committed + i;
+                    pos4_buf[0 * q_len + i] = p;
+                    pos4_buf[1 * q_len + i] = p;
+                    pos4_buf[2 * q_len + i] = p;
+                    pos4_buf[3 * q_len + i] = 0;
+                }
+                ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
+
+                {
+                    const int win_start_v = (verify_fa_window > 0 && committed > verify_fa_window)
+                                                ? (committed - verify_fa_window) : 0;
+                    const int win_len_v = committed + q_len - win_start_v;
+                    build_causal_mask(mask_buf, win_len_v, q_len, committed, g_kq_stride_pad, win_start_v);
+                }
+                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
+                T_verify_set = sync_us();
+                tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
+
+                st = ggml_backend_graph_compute(backend, sg.gf);
+                if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "verify compute %d\n", (int)st); return 1; }
+                T_verify_compute = sync_us();
+                tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
+
+                ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
+                                        sizeof(int32_t) * q_len);
             }
-            T_verify_build = sync_us();
-            tt_verify_build += std::chrono::duration<double, std::micro>(T_verify_build - T_snap).count();
-
-            std::vector<float> verify_embed(hidden * q_len);
-            if (!w.embedder.embed(draft_tok.data(), q_len, verify_embed.data())) return 1;
-            ggml_backend_tensor_set(sg.inp_embed, verify_embed.data(), 0,
-                                    sizeof(float) * verify_embed.size());
-
-            // M-RoPE axis-major layout: [axis0_tok0..axis0_tokN-1, axis1_..., axis2_..., axis3_...].
-            // First 3 axes hold the token position; axis 3 is always 0 for text.
-            for (int i = 0; i < q_len; i++) {
-                int p = committed + i;
-                pos4_buf[0 * q_len + i] = p;
-                pos4_buf[1 * q_len + i] = p;
-                pos4_buf[2 * q_len + i] = p;
-                pos4_buf[3 * q_len + i] = 0;
-            }
-            ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
-
-            {
-                const int win_start_v = (verify_fa_window > 0 && committed > verify_fa_window)
-                                            ? (committed - verify_fa_window) : 0;
-                const int win_len_v = committed + q_len - win_start_v;
-                build_causal_mask(mask_buf, win_len_v, q_len, committed, g_kq_stride_pad, win_start_v);
-            }
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
-            T_verify_set = sync_us();
-            tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
-
-            st = ggml_backend_graph_compute(backend, sg.gf);
-            if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "verify compute %d\n", (int)st); return 1; }
-            T_verify_compute = sync_us();
-            tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
-
-            ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
-                                    sizeof(int32_t) * q_len);
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
