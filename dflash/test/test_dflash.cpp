@@ -2516,10 +2516,11 @@ auto T0 = sync_us();
             auto T_ssd_skip = sync_us();
             tt_ssd_hit += std::chrono::duration<double, std::micro>(T_ssd_skip - T0).count();
 
-            // Clear ssd_cache — stale after committed changes.
-            ssd_cache.clear();
+            // Keep ssd_cache — persisted from the last draft iteration so the
+            // actual outcome check after verify can still match. Don't clear it
+            // or the cache hit chain breaks immediately.
             ssd_hit = false;  // consume the hit
-            ssd_outcomes.clear();  // no draft logits, can't select outcomes
+            ssd_outcomes.clear();  // no draft logits, can't select new outcomes
         }
 
         // 1) Noise block [last_tok, MASK*15]
@@ -2752,9 +2753,14 @@ auto T0 = sync_us();
         // forwards for each predicted outcome (accept_n, bonus_tok) pair.
         // On the next iteration, if the actual outcome matches a pre-computed
         // branch, we skip draft_compute entirely.
+        // Guard with !skip_draft: on cache-hit iterations, preserve the existing
+        // ssd_cache from the last draft run so the verify outcome check can find
+        // a match. Clearing + repopulating from stale logits breaks the chain.
         ssd_outcomes.clear();
-        ssd_cache.clear();  // stale after committed changes; recompute each iter
-        if (g_ssd_enabled && !ddtree_mode &&
+        if (!skip_draft) {
+            ssd_cache.clear();  // fresh cache for new draft this iteration
+        }
+        if (!skip_draft && g_ssd_enabled && !ddtree_mode &&
             !draft_logits_buf.empty() && draft_logits_buf.size() >= (size_t)vocab * q_len)
         {
             ssd_outcomes = saguaro_select_outcomes(
@@ -2970,30 +2976,6 @@ auto T0 = sync_us();
                 if (st != GGML_STATUS_SUCCESS) {
                     std::fprintf(stderr, "[ssd] branch compute failed: %d\n", (int)st);
                     break;
-                }
-
-                // Handle hidden bridge (peer copy draft → target, then project)
-                if (draft_hidden_bridge) {
-                    if (!proj_sg.gf || !proj_sg.hidden_input ||
-                        proj_sg.hidden_input->ne[1] != q_len) {
-                        if (!build_lm_head_projection_step(proj_sg, w, target_backend, q_len)) {
-                            std::fprintf(stderr, "[ssd] branch lm-head projection build failed\n");
-                            break;
-                        }
-                    }
-                    const size_t hidden_bytes = ggml_nbytes(ssd_branch_sg.hidden_states);
-                    if (!copy_peer_async(proj_sg.hidden_input->data, target_gpu,
-                                         ssd_branch_sg.hidden_states->data, draft_gpu,
-                                         hidden_bytes)) {
-                        std::fprintf(stderr, "[ssd] branch hidden bridge copy failed\n");
-                        break;
-                    }
-                    ggml_backend_synchronize(target_backend);
-                    st = ggml_backend_graph_compute(target_backend, proj_sg.gf);
-                    if (st != GGML_STATUS_SUCCESS) {
-                        std::fprintf(stderr, "[ssd] branch lm-head projection compute failed: %d\n", (int)st);
-                        break;
-                    }
                 }
 
                 // Extract branch draft tokens via argmax
